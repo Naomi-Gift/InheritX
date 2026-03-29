@@ -63,7 +63,7 @@ impl TestContext {
         let expires_at = chrono::Utc::now() + chrono::Duration::minutes(5);
 
         sqlx::query(
-            "INSERT INTO user_2fa (user_id, otp_hash, expires_at) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET otp_hash = $2, expires_at = $3"
+            "INSERT INTO user_2fa (user_id, otp_hash, expires_at) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET otp_hash = $2, expires_at = $3",
         )
         .bind(user_id)
         .bind(otp_hash)
@@ -82,7 +82,7 @@ pub async fn create_test_user(pool: &PgPool, email: &str) -> sqlx::Result<uuid::
     let wallet = format!("G{}", &user_id.to_string().replace("-", "")[..55]);
 
     sqlx::query(
-        "INSERT INTO users (id, email, wallet_address, kyc_status) VALUES ($1, $2, $3, 'approved')"
+        "INSERT INTO users (id, email, wallet_address, kyc_status) VALUES ($1, $2, $3, 'approved')",
     )
     .bind(user_id)
     .bind(email)
@@ -99,7 +99,7 @@ pub async fn create_test_admin(pool: &PgPool, email: &str) -> sqlx::Result<uuid:
     let password_hash = bcrypt::hash("test_password", bcrypt::DEFAULT_COST).unwrap();
 
     sqlx::query(
-        "INSERT INTO admins (id, email, password_hash, status) VALUES ($1, $2, $3, 'active')"
+        "INSERT INTO admins (id, email, password_hash, status) VALUES ($1, $2, $3, 'active')",
     )
     .bind(admin_id)
     .bind(email)
