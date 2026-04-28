@@ -12,6 +12,7 @@ import {
   mockWillDocuments,
   mockAuditLogs,
 } from "./data";
+import { notificationService } from "@/lib/notifications";
 
 // ─── Plans ────────────────────────────────────────────────────────────────────
 
@@ -391,6 +392,118 @@ export const willDocumentsHandlers = [
 
 // ─── Combined ─────────────────────────────────────────────────────────────────
 
+// ─── Notifications ────────────────────────────────────────────────────────────
+
+export const notificationsHandlers = [
+  // Send notification
+  http.post("/api/notifications/send", async ({ request }) => {
+    const body = (await request.json()) as any;
+    
+    try {
+      const results = await notificationService.send(body);
+      return HttpResponse.json({
+        status: "ok",
+        data: results,
+      });
+    } catch (error) {
+      return HttpResponse.json(
+        {
+          status: "error",
+          message: error instanceof Error ? error.message : "Failed to send notification",
+        },
+        { status: 400 }
+      );
+    }
+  }),
+
+  // Get user notifications
+  http.get("/api/notifications", ({ request }) => {
+    const url = new URL(request.url);
+    const user_id = url.searchParams.get("user_id");
+    const type = url.searchParams.get("type") as any;
+    const status = url.searchParams.get("status") as any;
+    const category = url.searchParams.get("category") as any;
+
+    if (!user_id) {
+      return HttpResponse.json(
+        { status: "error", message: "user_id required" },
+        { status: 400 }
+      );
+    }
+
+    const notifications = notificationService.getUserNotifications(user_id, {
+      type,
+      status,
+      category,
+    });
+
+    return HttpResponse.json({
+      status: "ok",
+      data: notifications,
+    });
+  }),
+
+  // Mark notification as read
+  http.put("/api/notifications/:id/read", ({ params }) => {
+    const success = notificationService.markAsRead(params.id as string);
+
+    if (!success) {
+      return HttpResponse.json(
+        { status: "error", message: "Notification not found" },
+        { status: 404 }
+      );
+    }
+
+    return HttpResponse.json({
+      status: "ok",
+      data: { id: params.id, read: true },
+    });
+  }),
+
+  // Get notification preferences
+  http.get("/api/notifications/preferences/:userId", ({ params }) => {
+    const prefs = notificationService.getPreferences(params.userId as string);
+
+    return HttpResponse.json({
+      status: "ok",
+      data: prefs,
+    });
+  }),
+
+  // Update notification preferences
+  http.put("/api/notifications/preferences/:userId", async ({ params, request }) => {
+    const body = (await request.json()) as any;
+    const prefs = notificationService.updatePreferences(
+      params.userId as string,
+      body
+    );
+
+    return HttpResponse.json({
+      status: "ok",
+      data: prefs,
+    });
+  }),
+
+  // Retry failed notification
+  http.post("/api/notifications/:id/retry", async ({ params }) => {
+    try {
+      const result = await notificationService.retry(params.id as string);
+      return HttpResponse.json({
+        status: "ok",
+        data: result,
+      });
+    } catch (error) {
+      return HttpResponse.json(
+        {
+          status: "error",
+          message: error instanceof Error ? error.message : "Failed to retry",
+        },
+        { status: 400 }
+      );
+    }
+  }),
+];
+
 export const handlers = [
   ...plansHandlers,
   ...claimsHandlers,
@@ -398,4 +511,5 @@ export const handlers = [
   ...emergencyHandlers,
   ...messagesHandlers,
   ...willDocumentsHandlers,
+  ...notificationsHandlers,
 ];
