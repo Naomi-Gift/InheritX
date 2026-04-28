@@ -472,9 +472,6 @@ pub enum DataKey {
     UserLoans(Address),          // Track multiple loans per user (Vec<u64>)
     RewardPool(Address),         // Per-asset reward pool
     UserStake(Address, Address), // (User, Asset) staking position
-    UserLoans(Address),          // Track multiple loans per user (Vec<u64>)
-    RewardPool,
-    UserStake(Address),   // Track user's staking position
     Insurance(u64),       // Insurance record for a loan_id
     InsuranceFund,        // Global insurance fund state
     InsurancePremiumRate, // Premium rate in basis points (default 200 = 2%)
