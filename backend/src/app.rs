@@ -1,6 +1,8 @@
 use axum::{
     extract::{Path, Query, State},
+    http::HeaderMap,
     middleware,
+    response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -15,9 +17,10 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+use crate::cache;
 use crate::middleware::{
-    request_id_middleware, request_logging_middleware, request_timeout_middleware,
-    security_headers_middleware,
+    cache_headers_middleware, request_id_middleware, request_logging_middleware,
+    request_timeout_middleware, security_headers_middleware,
 };
 use uuid::Uuid;
 
@@ -73,6 +76,7 @@ use base64::Engine as _;
 pub struct AppState {
     pub db: PgPool,
     pub config: Config,
+    pub cache: Arc<crate::cache::CacheService>,
     pub yield_service: Arc<dyn OnChainYieldService>,
     pub stress_testing_engine: Arc<StressTestingEngine>,
     pub insurance_fund_service: Arc<crate::insurance_fund::InsuranceFundService>,
@@ -112,15 +116,19 @@ pub async fn create_app(
     insurance_fund_service.clone().start();
 
     let webhook_service = Arc::new(WebhookService::new(db.clone()));
+    let cache = Arc::new(crate::cache::CacheService::from_env().await);
 
     let state = Arc::new(AppState {
         db: db.clone(),
         config: config.clone(),
+        cache,
         yield_service,
         stress_testing_engine,
         insurance_fund_service,
         webhook_service,
     });
+
+    let graphql_schema = crate::graphql::create_schema(db.clone());
 
     // ── Rate limiting (config-driven) ────────────────────────────────────────
     // Limits are read from environment variables via Config::load() so every
@@ -135,7 +143,6 @@ pub async fn create_app(
     let mut governor_builder = governor_builder.key_extractor(
         crate::middleware::RateLimitKeyExtractor::new(rl.bypass_tokens.clone()),
     );
-    governor_builder.error_handler(crate::middleware::rate_limit_error_response);
     let governor_conf = Arc::new(governor_builder.use_headers().finish().unwrap());
 
     let emergency_governor_conf = Arc::new(
@@ -193,6 +200,7 @@ pub async fn create_app(
 
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/ready", get(ready_check))
         .route("/health/db", get(db_health_check))
         // Admin login gets its own, tighter rate limit (brute-force protection).
         .route("/health/db/metrics", get(db_metrics))
@@ -210,9 +218,7 @@ pub async fn create_app(
         .route("/metrics", get(crate::metrics::metrics_handler))
         .route(
             "/admin/login",
-            post(crate::auth::login_admin).layer(GovernorLayer {
-                config: admin_login_governor_conf,
-            }),
+            post(crate::auth::login_admin).layer(GovernorLayer::new(admin_login_governor_conf)),
         )
         .route(
             "/api/plans/due-for-claim",
@@ -266,15 +272,13 @@ pub async fn create_app(
         )
         .route(
             "/api/emergency/access/grants",
-            post(create_emergency_access_grant).layer(GovernorLayer {
-                config: emergency_governor_conf.clone(),
-            }),
+            post(create_emergency_access_grant)
+                .layer(GovernorLayer::new(emergency_governor_conf.clone())),
         )
         .route(
             "/api/emergency/access/grants/:grant_id/revoke",
-            post(revoke_emergency_access_grant).layer(GovernorLayer {
-                config: emergency_governor_conf,
-            }),
+            post(revoke_emergency_access_grant)
+                .layer(GovernorLayer::new(emergency_governor_conf)),
         )
         .route(
             "/api/emergency/access/audit-logs",
@@ -625,6 +629,8 @@ pub async fn create_app(
         // duration including all inner middleware.
         .layer(middleware::from_fn(crate::metrics::track_metrics))
         .layer(middleware::from_fn(security_headers_middleware))
+        // Cache safety net: stamps no-store on all write-method responses.
+        .layer(middleware::from_fn(cache_headers_middleware))
         .layer(middleware::from_fn(request_logging_middleware))
         .layer(middleware::from_fn(request_id_middleware))
         // API versioning: inject X-API-Version header (Issue #439)
@@ -649,7 +655,7 @@ pub async fn create_app(
         .layer(cors_layer)
         // Inject the Prometheus handle so the /metrics handler can render output.
         .layer(axum::Extension(prometheus_handle))
-        .with_state(state);
+        .with_state(state.clone());
 
     // Add price feed routes with separate state
     let price_feed_state = (
@@ -691,7 +697,17 @@ pub async fn create_app(
         )
         .with_state(price_feed_state);
 
+    let graphql_router = Router::new()
+        .route("/api/graphql", post(crate::graphql::graphql_handler))
+        .route(
+            "/api/graphql/playground",
+            get(crate::graphql::graphql_playground),
+        )
+        .with_state(graphql_schema);
+
     Ok(app
+        .merge(graphql_router)
+        .merge(crate::data_retention::retention_router().with_state(state))
         .merge(price_routes)
         .layer(axum::middleware::from_fn(
             crate::middleware::attach_correlation_id,
@@ -700,13 +716,45 @@ pub async fn create_app(
             crate::middleware::log_rate_limit_violations,
         ))
         .layer(TraceLayer::new_for_http())
-        .layer(GovernorLayer {
-            config: governor_conf,
-        }))
+        .layer(
+            GovernorLayer::new(governor_conf)
+                .error_handler(crate::middleware::rate_limit_error_response),
+        ))
 }
 
 async fn health_check() -> Json<Value> {
-    Json(json!({ "status": "ok", "message": "App is healthy" }))
+    Json(json!({
+        "status": "ok",
+        "message": "App is running",
+        "service": "inheritx-backend"
+    }))
+}
+
+/// Readiness probe (Issue #478).
+///
+/// Checks database and external service connectivity.
+async fn ready_check(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<Json<Value>, ApiError> {
+    let db_status = match crate::db::ping(&state.db).await {
+        Ok(latency_ms) => json!({ "status": "ok", "latency_ms": latency_ms }),
+        Err(_) => json!({ "status": "error" }),
+    };
+
+    let overall_status = if db_status["status"] == "ok" {
+        "ok"
+    } else {
+        "error"
+    };
+
+    if overall_status == "error" {
+        return Err(ApiError::Internal(anyhow::anyhow!("Service not ready")));
+    }
+
+    Ok(Json(json!({
+        "status": overall_status,
+        "database": db_status
+    })))
 }
 
 /// Liveness + readiness probe for the database (Issue #420).
@@ -779,6 +827,8 @@ async fn create_plan(
     Json(req): Json<CreatePlanRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let plan = PlanService::create_plan(&state.db, user.user_id, &req).await?;
+    let _ = state.cache.invalidate_prefix("analytics:plan").await;
+    let _ = state.cache.invalidate("analytics:dashboard").await;
     Ok(Json(json!({
         "status": "success",
         "data": plan
@@ -789,13 +839,23 @@ async fn get_plan(
     State(state): State<Arc<AppState>>,
     Path(plan_id): Path<Uuid>,
     AuthenticatedUser(user): AuthenticatedUser,
-) -> Result<Json<Value>, ApiError> {
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
     let plan = PlanService::get_plan_by_id(&state.db, plan_id, user.user_id).await?;
     match plan {
-        Some(p) => Ok(Json(json!({
-            "status": "success",
-            "data": p
-        }))),
+        Some(p) => {
+            let body = json!({ "status": "success", "data": p });
+            let etag = cache::compute_etag(&body);
+            if cache::is_not_modified(&headers, &etag) {
+                return Ok(cache::not_modified_response_with_cc(
+                    &etag,
+                    cache::cache_control_private(60),
+                ));
+            }
+            let mut response = Json(body).into_response();
+            cache::apply_cache_headers(&mut response, &etag, cache::cache_control_private(60));
+            Ok(response)
+        }
         None => Err(ApiError::NotFound(format!("Plan {plan_id} not found"))),
     }
 }
@@ -807,6 +867,8 @@ async fn claim_plan(
     Json(req): Json<ClaimPlanRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let plan = PlanService::claim_plan(&state.db, plan_id, user.user_id, &req).await?;
+    let _ = state.cache.invalidate_prefix("analytics:plan").await;
+    let _ = state.cache.invalidate("analytics:dashboard").await;
     Ok(Json(json!({
         "status": "success",
         "message": "Claim recorded",
@@ -1192,15 +1254,26 @@ async fn simulate_loan(
 async fn get_user_simulations(
     State(state): State<Arc<AppState>>,
     AuthenticatedUser(user): AuthenticatedUser,
-) -> Result<Json<Value>, ApiError> {
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
     let limit = 50; // Default limit
     let simulations =
         LoanSimulationService::get_user_simulations(&state.db, user.user_id, limit).await?;
-    Ok(Json(json!({
+    let body = json!({
         "status": "success",
         "data": simulations,
         "count": simulations.len()
-    })))
+    });
+    let etag = cache::compute_etag(&body);
+    if cache::is_not_modified(&headers, &etag) {
+        return Ok(cache::not_modified_response_with_cc(
+            &etag,
+            cache::cache_control_private(120),
+        ));
+    }
+    let mut response = Json(body).into_response();
+    cache::apply_cache_headers(&mut response, &etag, cache::cache_control_private(120));
+    Ok(response)
 }
 
 /// Get a specific loan simulation by ID
@@ -1208,14 +1281,24 @@ async fn get_simulation(
     State(state): State<Arc<AppState>>,
     Path(simulation_id): Path<Uuid>,
     AuthenticatedUser(user): AuthenticatedUser,
-) -> Result<Json<Value>, ApiError> {
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
     let simulation =
         LoanSimulationService::get_simulation_by_id(&state.db, simulation_id, user.user_id).await?;
     match simulation {
-        Some(sim) => Ok(Json(json!({
-            "status": "success",
-            "data": sim
-        }))),
+        Some(sim) => {
+            let body = json!({ "status": "success", "data": sim });
+            let etag = cache::compute_etag(&body);
+            if cache::is_not_modified(&headers, &etag) {
+                return Ok(cache::not_modified_response_with_cc(
+                    &etag,
+                    cache::cache_control_private(300),
+                ));
+            }
+            let mut response = Json(body).into_response();
+            cache::apply_cache_headers(&mut response, &etag, cache::cache_control_private(300));
+            Ok(response)
+        }
         None => Err(ApiError::NotFound(format!(
             "Simulation {simulation_id} not found"
         ))),
@@ -1228,13 +1311,21 @@ async fn get_simulation(
 async fn get_user_reputation(
     State(state): State<Arc<AppState>>,
     AuthenticatedUser(user): AuthenticatedUser,
-) -> Result<Json<Value>, ApiError> {
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
     let reputation =
         crate::reputation::ReputationService::get_reputation(&state.db, user.user_id).await?;
-    Ok(Json(json!({
-        "status": "success",
-        "data": reputation
-    })))
+    let body = json!({ "status": "success", "data": reputation });
+    let etag = cache::compute_etag(&body);
+    if cache::is_not_modified(&headers, &etag) {
+        return Ok(cache::not_modified_response_with_cc(
+            &etag,
+            cache::cache_control_private(120),
+        ));
+    }
+    let mut response = Json(body).into_response();
+    cache::apply_cache_headers(&mut response, &etag, cache::cache_control_private(120));
+    Ok(response)
 }
 
 // Loan Lifecycle Endpoints
@@ -1284,10 +1375,21 @@ async fn list_lifecycle_loans(
 async fn get_lifecycle_summary(
     State(state): State<Arc<AppState>>,
     AuthenticatedUser(user): AuthenticatedUser,
-) -> Result<Json<Value>, ApiError> {
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
     let summary =
         LoanLifecycleService::get_lifecycle_summary(&state.db, Some(user.user_id)).await?;
-    Ok(Json(json!({ "status": "success", "data": summary })))
+    let body = json!({ "status": "success", "data": summary });
+    let etag = cache::compute_etag(&body);
+    if cache::is_not_modified(&headers, &etag) {
+        return Ok(cache::not_modified_response_with_cc(
+            &etag,
+            cache::cache_control_private(60),
+        ));
+    }
+    let mut response = Json(body).into_response();
+    cache::apply_cache_headers(&mut response, &etag, cache::cache_control_private(60));
+    Ok(response)
 }
 
 /// Fetch a single loan by its UUID.
@@ -1297,9 +1399,20 @@ async fn get_lifecycle_loan(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     AuthenticatedUser(_user): AuthenticatedUser,
-) -> Result<Json<Value>, ApiError> {
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
     let record = LoanLifecycleService::get_loan(&state.db, id).await?;
-    Ok(Json(json!({ "status": "success", "data": record })))
+    let body = json!({ "status": "success", "data": record });
+    let etag = cache::compute_etag(&body);
+    if cache::is_not_modified(&headers, &etag) {
+        return Ok(cache::not_modified_response_with_cc(
+            &etag,
+            cache::cache_control_private(60),
+        ));
+    }
+    let mut response = Json(body).into_response();
+    cache::apply_cache_headers(&mut response, &etag, cache::cache_control_private(60));
+    Ok(response)
 }
 
 /// Apply a repayment to a loan.  When cumulative repayments reach or exceed
@@ -1443,6 +1556,8 @@ async fn pause_plan(
     Json(req): Json<PausePlanRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let result = EmergencyAdminService::pause_plan(&state.db, admin.admin_id, &req).await?;
+    let _ = state.cache.invalidate_prefix("analytics:plan").await;
+    let _ = state.cache.invalidate("analytics:dashboard").await;
     Ok(Json(json!({ "status": "success", "data": result })))
 }
 
@@ -1452,6 +1567,8 @@ async fn unpause_plan(
     Json(req): Json<UnpausePlanRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let result = EmergencyAdminService::unpause_plan(&state.db, admin.admin_id, &req).await?;
+    let _ = state.cache.invalidate_prefix("analytics:plan").await;
+    let _ = state.cache.invalidate("analytics:dashboard").await;
     Ok(Json(json!({ "status": "success", "data": result })))
 }
 
@@ -1548,9 +1665,19 @@ async fn create_governance_proposal(
 
 async fn list_governance_proposals(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<Proposal>>, ApiError> {
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
     let proposals = GovernanceService::list_proposals(&state.db).await?;
-    Ok(Json(proposals))
+    let etag = cache::compute_etag(&proposals);
+    if cache::is_not_modified(&headers, &etag) {
+        return Ok(cache::not_modified_response_with_cc(
+            &etag,
+            cache::cache_control_public(120),
+        ));
+    }
+    let mut response = Json(proposals).into_response();
+    cache::apply_cache_headers(&mut response, &etag, cache::cache_control_public(120));
+    Ok(response)
 }
 
 async fn vote_on_governance_proposal(

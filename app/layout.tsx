@@ -77,6 +77,8 @@ export const viewport: Viewport = {
   themeColor: "#161E22",
 };
 
+import { Vitals } from "@/app/components/Vitals";
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -107,6 +109,7 @@ export default function RootLayout({
         className={`${outfit.variable} ${geistMono.variable} antialiased`}
         suppressHydrationWarning
       >
+        <Vitals />
         <AdminAuthProvider>
           <WalletProvider>
             <KYCProvider>
